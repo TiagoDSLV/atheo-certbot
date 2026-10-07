@@ -1,0 +1,9 @@
+[Unit]
+Description=Synthese certificats chaque lundi matin
+
+[Timer]
+OnCalendar=Mon *-*-* 07:30:00
+Persistent=true
+
+[Install]
+WantedBy=timers.target

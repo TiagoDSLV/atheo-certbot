@@ -1,0 +1,10 @@
+[Unit]
+Description=Cycle TBSCertBot + tbs-delivery deux fois par jour
+
+[Timer]
+OnCalendar=*-*-* 06,14:00:00
+RandomizedDelaySec=45min
+Persistent=true
+
+[Install]
+WantedBy=timers.target

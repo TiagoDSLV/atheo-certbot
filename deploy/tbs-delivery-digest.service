@@ -1,0 +1,11 @@
+[Unit]
+Description=Synthese hebdomadaire des certificats (equipe interne)
+
+[Service]
+Type=oneshot
+User=tbscertbot
+Group=tbscertbot
+EnvironmentFile=-/etc/tbs-delivery/env
+Environment=TBS_DELIVERY_CONFIG=/etc/tbs-delivery/config.yaml
+WorkingDirectory=/opt/tbs-delivery
+ExecStart=/opt/tbs-delivery/venv/bin/python -m tbsdelivery digest

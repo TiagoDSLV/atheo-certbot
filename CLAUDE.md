@@ -32,15 +32,21 @@ refabrication et la livraison manuelles ne tiennent plus.
 **Stack** : Python 3 (cryptography, PyYAML, pyzipper), hooks shell, units systemd,
 SQLite pour l'état, TBSCertBot (PHP) à part.
 
-**Commandes** (⚠ reprises de la description du projet, pas encore vérifiées dans le
-code : le dépôt était vide lors de la mise en place, voir `tasks/rapport-setup.md`)
+**Structure** : `tbsdelivery/` (CLI `__main__.py`, `hooks.py`, `package.py`, `mailer.py`,
+`inventory.py`, `state.py`, `report.py`, `bootstrap.py`, `dns_gandi.py`, `templates.py`,
+`config.py`), `hooks/` (wrappers shell, toujours `exit 0`), `deploy/` (units systemd),
+`tests/test_e2e.py` (5 tests de bout en bout, PKI de test via openssl).
+
+**Commandes** (vérifiées dans le code)
 ```bash
-# Lancer (dry-run par défaut : les mails sont écrits en .eml dans outbox/)
+# Lancer (dry-run par défaut : les mails sont écrits en .eml dans paths.outbox)
 python3 -m tbsdelivery -c config.yaml status
 # ou : TBS_DELIVERY_CONFIG=config.yaml python3 -m tbsdelivery status
-# sans config : /etc/tbs-delivery/config.yaml
-# commandes : import-csv, report, bootstrap, conf-snippet, hook download|dcv,
-#             notify, digest, status
+# sans -c ni variable : /etc/tbs-delivery/config.yaml, sinon ./config.yaml
+# commandes : import-csv, report, bootstrap, conf-snippet, hook download|dcv [--force],
+#             notify, digest [--print], status
+# chemins relatifs de la config = relatifs au fichier de config ;
+# en prod : /var/lib/tbs-delivery (état, ZIP, outbox), /var/log/tbs-delivery
 
 # Tester (requiert le binaire openssl et requirements.txt)
 python3 -m unittest discover -s tests -v
@@ -83,7 +89,8 @@ Autres sous-agents : `explorateur` (cartographie du code, lecture seule) et
 
 - Aucun secret ni donnée client dans le code, les tests ou les commits. Les tests
   utilisent des données fictives (ex. `client-a.fr`). Ne pas ouvrir `parc-actuel/`,
-  `outbox/`, `deliveries/`, `state.db`, les clés ni les exports CSV TBS.
+  `inventory.yaml`, `outbox/`, `deliveries/`, `state.db`, les journaux, les clés ni les
+  exports CSV TBS.
 - Jamais de push sur `main` sans mon accord.
 - Jamais de passage en mode live.
 - Aucun appel réel à l'API TBS, au SMTP ou à Gandi sans mon accord.

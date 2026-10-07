@@ -7,6 +7,10 @@
 parc-actuel/
 # Exports CSV TBS posés à la racine (ex. 20261007084433.csv, plan_action_*.csv)
 /*.csv
+# Inventaire local (noms, mails), script bootstrap (réf. TBS), archive du projet avec parc-actuel/
+inventory.yaml
+/bootstrap*.sh
+/*.zip
 
 # --- Fichiers produits à l'exécution ---
 # .eml du dry-run : contiennent les mots de passe des ZIP
@@ -20,6 +24,9 @@ data/keys/
 *.key
 *.pfx
 *.p12
+# Mails dry-run et journaux (destinataires, noms de clients)
+*.eml
+*.log
 
 # --- Configuration locale et secrets ---
 /config.yaml

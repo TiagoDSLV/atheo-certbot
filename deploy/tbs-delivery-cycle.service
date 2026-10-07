@@ -1,0 +1,13 @@
+[Unit]
+Description=TBSCertBot (refabrication/telechargement) + tbs-delivery (DCV)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=tbscertbot
+Group=tbscertbot
+EnvironmentFile=-/etc/tbs-delivery/env
+Environment=TBS_DELIVERY_CONFIG=/etc/tbs-delivery/config.yaml
+ExecStart=/opt/tbs-delivery/deploy/tbscertbot-cycle.sh
+UMask=0077

@@ -5,6 +5,9 @@
       "Read(./.env.*)",
       "Read(./parc-actuel/**)",
       "Read(./*.csv)",
+      "Read(./inventory.yaml)",
+      "Read(./bootstrap*.sh)",
+      "Read(./*.zip)",
       "Read(./outbox/**)",
       "Read(./deliveries/**)",
       "Read(./state.db)",
@@ -17,7 +20,12 @@
       "Read(./config.yaml)",
       "Read(./env)",
       "Read(//etc/tbs-delivery/config.yaml)",
-      "Read(//etc/tbs-delivery/env)"
+      "Read(//etc/tbs-delivery/env)",
+      "Read(**/*.eml)",
+      "Read(**/*.log)",
+      "Read(//var/lib/tbs-delivery/**)",
+      "Read(//var/log/tbs-delivery/**)",
+      "Read(//opt/tbscertbot/data/keys/**)"
     ]
   }
 }
