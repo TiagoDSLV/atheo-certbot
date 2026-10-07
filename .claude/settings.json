@@ -1,0 +1,23 @@
+{
+  "permissions": {
+    "deny": [
+      "Read(./.env)",
+      "Read(./.env.*)",
+      "Read(./parc-actuel/**)",
+      "Read(./*.csv)",
+      "Read(./outbox/**)",
+      "Read(./deliveries/**)",
+      "Read(./state.db)",
+      "Read(./state.db-*)",
+      "Read(./data/keys/**)",
+      "Read(**/*.pkey)",
+      "Read(**/*.key)",
+      "Read(**/*.pfx)",
+      "Read(**/*.p12)",
+      "Read(./config.yaml)",
+      "Read(./env)",
+      "Read(//etc/tbs-delivery/config.yaml)",
+      "Read(//etc/tbs-delivery/env)"
+    ]
+  }
+}

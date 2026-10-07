@@ -1,0 +1,35 @@
+# --- Claude Code ---
+# Seul le fichier de réglages personnel est ignoré ; .claude/settings.json et
+# .claude/agents/ sont partagés via git.
+.claude/settings.local.json
+
+# --- Données client (ne jamais committer) ---
+parc-actuel/
+# Exports CSV TBS posés à la racine (ex. 20261007084433.csv, plan_action_*.csv)
+/*.csv
+
+# --- Fichiers produits à l'exécution ---
+# .eml du dry-run : contiennent les mots de passe des ZIP
+outbox/
+# ZIP livrés : contiennent les clés privées
+deliveries/
+state.db
+state.db-*
+data/keys/
+*.pkey
+*.key
+*.pfx
+*.p12
+
+# --- Configuration locale et secrets ---
+/config.yaml
+/env
+.env
+.env.*
+!.env.example
+
+# --- Python ---
+__pycache__/
+*.py[cod]
+.venv/
+venv/
