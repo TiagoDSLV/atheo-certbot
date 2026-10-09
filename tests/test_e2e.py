@@ -8,6 +8,7 @@ import email
 import os
 import re
 import shutil
+import sqlite3
 import subprocess
 import tempfile
 import unittest
@@ -15,6 +16,7 @@ from email import policy
 from pathlib import Path
 
 import pyzipper
+import yaml
 from cryptography.hazmat.primitives.serialization import pkcs12
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -126,6 +128,121 @@ class EndToEnd(unittest.TestCase):
         self.hook("download", reference="2000000001", cn="intranet.inconnu.fr", key=key, cert=cert, chain=chain)
         for m in self.outbox():
             self.assertEqual(self.msg(m)["To"], "certificats@atheo.net")
+
+    # ------------------------------------------- surcharges par certificat (défaut 2b)
+    INTERNAL = "certificats@atheo.net"
+
+    def set_delivery(self, ref, **delivery):
+        inv_path = self.tmp / "inventory.yaml"
+        data = yaml.safe_load(inv_path.read_text(encoding="utf-8"))
+        for c in data["certificates"]:
+            if c["ref"] == ref:
+                c["delivery"] = delivery
+        inv_path.write_text(yaml.safe_dump(data, allow_unicode=True), encoding="utf-8")
+
+    def zip_names(self, zip_bytes, password):
+        zp = self.tmp / "d.zip"
+        zp.write_bytes(zip_bytes)
+        with pyzipper.AESZipFile(zp) as z:
+            z.setpassword(password.encode())
+            names = z.namelist()
+            z.read(names[0])  # lève une erreur si le mot de passe est faux
+        return names
+
+    def assert_password_internal_only(self):
+        mails = [self.msg(m) for m in self.outbox()]
+        self.assertEqual(len(mails), 2)
+        to_client = [m for m in mails if "jean@client-a.fr" in f"{m['To']} {m['Cc'] or ''}"]
+        internal_only = [m for m in mails if m["To"] == self.INTERNAL and not m["Cc"]]
+        self.assertEqual(len(to_client), 1)
+        self.assertEqual(len(internal_only), 1)
+        password = re.search(r"Mot de passe \(ZIP et PFX\) : (\S+)",
+                             internal_only[0].get_body().get_content()).group(1)
+        zip_bytes = next(to_client[0].iter_attachments()).get_content()
+        self.zip_names(zip_bytes, password)  # c'est bien le mot de passe de l'archive
+        self.assertNotIn(password, to_client[0].get_body().get_content())
+
+    def test_per_cert_password_internal_only(self):
+        self.set_delivery("1000000001", password_channel="internal_only")
+        key, cert, chain = self.pki("1000000001", "www.client-a.fr")
+        self.hook("download", reference="1000000001", cn="www.client-a.fr", key=key, cert=cert, chain=chain)
+        self.assert_password_internal_only()
+
+    def test_unknown_password_channel_falls_back_to_internal(self):
+        self.set_delivery("1000000001", password_channel="internal-only")  # faute de frappe
+        key, cert, chain = self.pki("1000000001", "www.client-a.fr")
+        self.hook("download", reference="1000000001", cn="www.client-a.fr", key=key, cert=cert, chain=chain)
+        self.assert_password_internal_only()
+
+    def test_per_cert_pfx_disabled(self):
+        self.set_delivery("1000000001", pfx=False)
+        key, cert, chain = self.pki("1000000001", "www.client-a.fr")
+        self.hook("download", reference="1000000001", cn="www.client-a.fr", key=key, cert=cert, chain=chain)
+        mails = self.outbox()
+        main = self.msg([m for m in mails if "Mot_de_passe" not in m.name][0])
+        pwd_mail = self.msg([m for m in mails if "Mot_de_passe" in m.name][0])
+        password = re.search(r"\n    (\S+)\n", pwd_mail.get_body().get_content()).group(1)
+        names = self.zip_names(next(main.iter_attachments()).get_content(), password)
+        self.assertEqual(len(names), 5)
+        self.assertFalse(any(n.endswith(".pfx") for n in names))
+
+    # ------------------------------------------- erreurs inattendues (défaut 2)
+    def assert_single_internal_alert(self):
+        mails = self.outbox()
+        self.assertEqual(len(mails), 1)
+        self.assertIn("ALERTE", mails[0].name)
+        alert = self.msg(mails[0])
+        self.assertEqual(alert["To"], self.INTERNAL)
+        self.assertIsNone(alert["Cc"])
+        self.assertNotIn("PRIVATE KEY", alert.get_body().get_content())
+        return alert
+
+    def break_inventory(self):
+        (self.tmp / "inventory.yaml").write_text("certificates: [ {ref: 1\n", encoding="utf-8")
+
+    def test_corrupt_certificate_alerts_internal(self):
+        key, _, chain = self.pki("1000000001", "www.client-a.fr")
+        bad = self.tmp / "corrompu.cer"
+        bad.write_text("-----BEGIN CERTIFICATE-----\nabc\n-----END CERTIFICATE-----\n", encoding="utf-8")
+        self.hook("download", reference="1000000001", cn="www.client-a.fr", key=key, cert=str(bad), chain=chain)
+        self.assert_single_internal_alert()
+        self.assertIn("failed", self.run_cli("status").split("DCV ouvertes")[0])
+        self.assertIn("ValueError", (self.tmp / "st/log.txt").read_text(encoding="utf-8"))
+
+    def test_invalid_inventory_download_alerts_internal(self):
+        key, cert, chain = self.pki("1000000001", "www.client-a.fr")
+        self.break_inventory()
+        self.hook("download", reference="1000000001", cn="www.client-a.fr", key=key, cert=cert, chain=chain)
+        self.assert_single_internal_alert()
+
+    def test_error_after_sending_says_mails_may_have_left(self):
+        self.run_cli("status")  # crée la base d'état
+        db = sqlite3.connect(self.tmp / "st/state.db")
+        db.execute("CREATE TRIGGER panne BEFORE INSERT ON deliveries "
+                   "BEGIN SELECT RAISE(ABORT, 'disque plein simule'); END")
+        db.commit()
+        db.close()
+        key, cert, chain = self.pki("1000000001", "www.client-a.fr")
+        self.hook("download", reference="1000000001", cn="www.client-a.fr", key=key, cert=cert, chain=chain)
+        mails = self.outbox()
+        self.assertEqual(len(mails), 3)  # ZIP + mot de passe au client, puis l'alerte
+        alert_msg = self.msg([m for m in mails if "ALERTE" in m.name][0])
+        alert = alert_msg.get_body().get_content()
+        self.assertIn("ont pu partir", alert)
+        self.assertNotIn("Rien n'a été envoyé", alert)
+        self.assertEqual(alert_msg["To"], self.INTERNAL)
+        self.assertIsNone(alert_msg["Cc"])
+        pwd_mail = self.msg([m for m in mails if "Mot_de_passe" in m.name][0])
+        password = re.search(r"\n    (\S+)\n", pwd_mail.get_body().get_content()).group(1)
+        self.assertNotIn(password, alert)
+        self.assertNotIn("PRIVATE KEY", alert)
+
+    def test_invalid_inventory_dcv_alerts_internal(self):
+        self.break_inventory()
+        self.hook("dcv", reference="1000000002", cn="mail.client-b.fr", dcv_method="dns-cname-token",
+                  dcv_domain_root="client-b.fr", dcv_domain_sub="_abc.mail", dcv_value="x.sectigo.com",
+                  registrar="OVH SAS")
+        self.assert_single_internal_alert()
 
 
 if __name__ == "__main__":

@@ -38,6 +38,15 @@ def _locate(inv: Inventory, state: State, ref: str, cn: str, sans: list) -> Cert
 # ------------------------------------------------------------------------- download
 
 def handle_download(cfg: dict, force: bool = False) -> int:
+    progress = {"sending": False}  # passe à True dès le premier envoi au client
+    try:
+        return _handle_download(cfg, force, progress)
+    except Exception as exc:  # noqa: BLE001 - aucune erreur ne doit rester silencieuse
+        _unexpected_error(cfg, "download", exc, record=True, maybe_sent=progress["sending"])
+        return 0  # ne pas faire échouer TBSCertBot : l'alerte interne suffit
+
+
+def _handle_download(cfg: dict, force: bool, progress: dict) -> int:
     ref = _env("PHP_TBS_REFERENCE")
     cn = _env("PHP_TBS_CN")
     sans = [s.strip() for s in _env("PHP_TBS_SAN").split(",") if s.strip()]
@@ -52,6 +61,7 @@ def handle_download(cfg: dict, force: bool = False) -> int:
     company = cfg["internal"]["company"]
     signature = cfg["internal"]["signature"]
     dcfg = cfg["delivery"]
+    dspec = dict(dcfg)  # réglages effectifs : config globale + surcharge du certificat
 
     serial = peek_serial(cert) if cert else None
     if serial and state.already_delivered(serial) and not force:
@@ -69,7 +79,7 @@ def handle_download(cfg: dict, force: bool = False) -> int:
                 log.info("ref %s (%s) marquée non gérée : rien à livrer", ref, item.cn)
                 return 0
             client, admin = item.client, item.admin_email
-            dspec = {**dcfg, **(item.delivery or {})}
+            dspec.update(item.delivery or {})
             to = resolve_recipients(dspec.get("recipients", []), client_admin=admin, internal=internal)
             cc = resolve_recipients(dspec.get("cc", []), client_admin=admin, internal=internal)
             if not to:
@@ -81,8 +91,8 @@ def handle_download(cfg: dict, force: bool = False) -> int:
         out_dir = Path(cfg["paths"]["deliveries"]) / (item.client_slug if item else "non-reference") / safe_name(cn)
         pkg = build_package(
             key_path=key, cert_path=cert, chain_path=chain, out_dir=out_dir, client=client, company=company,
-            pfx=bool(dcfg.get("pfx", True)), pfx_legacy=bool(dcfg.get("pfx_legacy", False)),
-            zip_encrypt=bool(dcfg.get("zip_encrypt", True)),
+            pfx=bool(dspec.get("pfx", True)), pfx_legacy=bool(dspec.get("pfx_legacy", False)),
+            zip_encrypt=bool(dspec.get("zip_encrypt", True)),
         )
     except PackageError as exc:
         log.error("ref %s : fabrication impossible : %s", ref, exc)
@@ -92,9 +102,10 @@ def handle_download(cfg: dict, force: bool = False) -> int:
         state.close()
         return 0  # ne pas faire échouer TBSCertBot : l'alerte interne suffit
 
-    attach_ok = pkg.zip_path.stat().st_size <= float(dcfg.get("attach_max_mb", 15)) * 1024 * 1024
-    channel = "internal_only" if item is None else dcfg.get("password_channel", "separate_email")
+    attach_ok = pkg.zip_path.stat().st_size <= float(dspec.get("attach_max_mb", 15)) * 1024 * 1024
+    channel = "internal_only" if item is None else _password_channel(dspec, cn)
     status, detail = "sent", ""
+    progress["sending"] = True
     try:
         subject, body = templates.delivery(client=client, info=pkg.info, zip_name=pkg.zip_path.name,
                                            password_channel=channel, attached=attach_ok,
@@ -130,6 +141,51 @@ def handle_download(cfg: dict, force: bool = False) -> int:
     return 0
 
 
+def _password_channel(dspec: dict, cn: str) -> str:
+    """Canal du mot de passe ; toute valeur inconnue retombe sur l'équipe interne."""
+    channel = dspec.get("password_channel", "separate_email")
+    if channel not in ("separate_email", "internal_only"):
+        log.warning("password_channel inconnu (%r) pour %s : mot de passe envoyé à l'équipe interne", channel, cn)
+        return "internal_only"
+    return channel
+
+
+def _unexpected_error(cfg: dict, hook: str, exc: Exception, record: bool, maybe_sent: bool = False) -> None:
+    """Erreur non prévue dans un hook : journal, trace en base (download) et alerte interne.
+
+    Le garde-fou n'envoie rien au client ; `maybe_sent` signale que l'erreur est
+    survenue après le début des envois (des mails ont pu partir). L'alerte ne reprend que le type et le message de
+    l'exception, jamais le contenu des fichiers (clé privée) ni le mot de passe.
+    """
+    ref, cn = _env("PHP_TBS_REFERENCE"), _env("PHP_TBS_CN")
+    log.exception("hook %s : erreur inattendue pour ref=%s cn=%s", hook, ref, cn)
+    detail = f"{type(exc).__name__} : {exc}"
+    if record:
+        try:
+            state = State(cfg["paths"]["state_db"])
+            state.record_delivery(tbs_ref=ref, inventory_ref=None, client=None, cn=cn, serial=f"ERR-{ref}",
+                                  status="failed", detail=detail)
+            state.close()
+        except Exception:  # noqa: BLE001
+            log.exception("impossible d'enregistrer l'échec en base")
+    try:
+        mailer = Mailer(cfg)
+    except Exception:  # noqa: BLE001
+        log.exception("impossible de préparer l'alerte interne")
+        return
+    if maybe_sent:
+        advice = ("ATTENTION : l'erreur est survenue après le début des envois. Des mails ont pu partir au "
+                  "client (archive et mot de passe). Vérifier le journal et la boîte d'envoi AVANT toute "
+                  "relance : une relance enverrait une nouvelle archive avec un nouveau mot de passe.")
+    elif hook == "download":
+        advice = ("Rien n'a été envoyé au client. Après correction de la cause, relancer :\n"
+                  f"  php tbscertbot.php test-hook download {ref}")
+    else:
+        advice = "Rien n'a été envoyé au client. Le challenge DCV n'a pas été enregistré."
+    _alert_internal(mailer, cfg, f"Erreur inattendue du hook {hook} : {cn} (réf. {ref})",
+                    f"{detail}\n\n{advice}\n\nDétails dans le journal de tbs-delivery.")
+
+
 def _alert_internal(mailer: Mailer, cfg: dict, subject: str, body: str) -> None:
     company = cfg["internal"]["company"]
     try:
@@ -147,6 +203,14 @@ def handle_dcv(cfg: dict) -> int:
     L'envoi au client est regroupé par certificat par la commande `notify`
     (lancée juste après `tbscertbot.php cron`), pour éviter un mail par SAN.
     """
+    try:
+        return _handle_dcv(cfg)
+    except Exception as exc:  # noqa: BLE001 - aucune erreur ne doit rester silencieuse
+        _unexpected_error(cfg, "dcv", exc, record=False)
+        return 0  # ne pas faire échouer TBSCertBot
+
+
+def _handle_dcv(cfg: dict) -> int:
     ref = _env("PHP_TBS_REFERENCE")
     cn = _env("PHP_TBS_CN")
     method = _env("PHP_TBS_DCV_METHOD") or "http-token"

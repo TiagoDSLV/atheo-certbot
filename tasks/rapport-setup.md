@@ -73,12 +73,12 @@ pyzipper 0.4.0.
 | # | Fonction / comportement | Code | Constat |
 |---|---|---|---|
 | 1 | **Surcharges manuelles après changement de réf.** (`merge_from_csv`) | `inventory.py:320-346` | ⚠ **Défaut confirmé par sonde** : si un nouvel export TBS porte une réf. différente pour le même certificat, les surcharges (`delivery`, `dcv`, `managed: false`…) sont **perdues**, et l'ancienne entrée est supprimée, sauf si ses `notes` commencent par `[manuel]` (convention non documentée). Conséquence : mails au contact admin par défaut au lieu du destinataire choisi, ou reprise d'un certificat exclu. Conservation OK si la réf. est identique. |
-| 2 | **Erreur inattendue dans le hook download** | `hooks.py:48-93` | ⚠ **Défaut confirmé par sonde** : seule `PackageError` est rattrapée. Toute autre exception rend l'échec **silencieux** : pas d'alerte interne, pas de ligne en base, et la trace part seulement sur stderr, pas dans le fichier journal. Exemples : certificat PEM corrompu (`ValueError`), faute de frappe YAML dans `inventory.yaml` (bloque alors **toutes** les livraisons), droits insuffisants sur le dossier de sortie, erreur SQLite. TBSCertBot n'échoue pas (le wrapper fait `exit 0`) et rien ne part au client. |
-| 2b | **Surcharge `password_channel` par certificat ignorée** | `hooks.py:84-86, 95-96` | ⚠ **Défaut confirmé par le relecteur (sonde) et à la lecture** : la surcharge `delivery` de l'inventaire n'est appliquée qu'aux destinataires. `password_channel`, `pfx`, `pfx_legacy`, `zip_encrypt` et `attach_max_mb` sont lus dans la config globale. Avec `delivery: {password_channel: internal_only}` sur un certificat, **le mot de passe part quand même au client**. |
+| 2 | ✅ **Corrigé (voir « Corrections » ci-dessous)** — **Erreur inattendue dans le hook download** | `hooks.py:48-93` | ⚠ **Défaut confirmé par sonde** : seule `PackageError` est rattrapée. Toute autre exception rend l'échec **silencieux** : pas d'alerte interne, pas de ligne en base, et la trace part seulement sur stderr, pas dans le fichier journal. Exemples : certificat PEM corrompu (`ValueError`), faute de frappe YAML dans `inventory.yaml` (bloque alors **toutes** les livraisons), droits insuffisants sur le dossier de sortie, erreur SQLite. TBSCertBot n'échoue pas (le wrapper fait `exit 0`) et rien ne part au client. |
+| 2b | ✅ **Corrigé** — **Surcharge `password_channel` par certificat ignorée** | `hooks.py:84-86, 95-96` | ⚠ **Défaut confirmé par le relecteur (sonde) et à la lecture** : la surcharge `delivery` de l'inventaire n'est appliquée qu'aux destinataires. `password_channel`, `pfx`, `pfx_legacy`, `zip_encrypt` et `attach_max_mb` sont lus dans la config globale. Avec `delivery: {password_channel: internal_only}` sur un certificat, **le mot de passe part quand même au client**. |
 | 2c | **Idempotence : livraison enregistrée après l'envoi** | `hooks.py:98-125` | ⚠ Constat du relecteur, à la lecture. Un plantage entre l'envoi et `record_delivery` entraîne une 2e livraison au passage suivant (nouveau ZIP, nouveau mot de passe). Si le mail du ZIP part et que celui du mot de passe échoue, le statut `failed` n'est pas compté comme livré : le client a un ZIP sans mot de passe, et la relance conseillée envoie un autre ZIP avec un autre mot de passe. |
 | 2d | **Rapprochement par un seul SAN** | `inventory.py:369-375`, `hooks.py:78-79` | Constat du relecteur. Si la réf. et le CN sont inconnus, un seul SAN commun avec un certificat d'un autre client suffit pour lui livrer le ZIP, clé comprise, puis l'alias est mémorisé. Probabilité faible, conséquence grave. |
 | 3 | Refus d'un certificat expiré | `package.py:198` | Non testé. Code correct à la lecture (`days_left < 0` → `PackageError` → alerte interne). |
-| 4 | `password_channel: internal_only` pour un client connu | `hooks.py:96-112` | Non testé. Correct si l'option est réglée dans la config globale ; **ignorée si elle est réglée par certificat** (voir 2b). |
+| 4 | `password_channel: internal_only` pour un client connu | `hooks.py:96-112` | Non testé. Correct si l'option est réglée dans la config globale ; ignorée si elle était réglée par certificat (voir 2b, corrigé ; désormais testé). |
 | 5 | Relivraison forcée (`--force`, `TBS_DELIVERY_FORCE=1`) | `hooks.py:45,57` | Non testé. |
 | 6 | Envoi SMTP réel (`mailer.send`) | `mailer.py:64-93` | Non testé. Remarque : si `starttls: false` et `username` renseigné, l'authentification part **en clair** (pas de garde-fou). L'exemple de config utilise bien STARTTLS. |
 | 7 | Relances DCV (délai, maximum) | `hooks.py:234-238` | Non testé. Sonde : 1 envoi initial + 5 relances = 6 mails, conforme au README. |
@@ -94,6 +94,40 @@ pyzipper 0.4.0.
 | 18 | DCV redemandée avec le même enregistrement | `state.py:126` | Constat du relecteur. Si la réf. TBS et le CNAME restent identiques (`reuse-keys`), une nouvelle demande retombe sur une ligne `done` et reste `done` : client jamais notifié, absente du digest. |
 | 19 | Points mineurs | `package.py`, `hooks.py:228` | Pas de contrôle de `not_before` (un certificat pas encore valide serait livré) ; dans `notify`, un échec SMTP sur une DCV HTTP interrompt les notifications des autres certificats. |
 | 17 | Fermeture de la base si certificat « non géré » | `hooks.py:68-70` | `return` sans `state.close()` : sans effet grave (fin de processus). |
+
+## Corrections apportées ensuite (défauts 2 et 2b)
+
+Plan validé dans `tasks/todo.md`. Seul fichier applicatif modifié : `tbsdelivery/hooks.py`.
+
+- **2b** : les 5 options de livraison (`password_channel`, `pfx`, `pfx_legacy`,
+  `zip_encrypt`, `attach_max_mb`) suivent désormais la surcharge du certificat. Toute
+  valeur de `password_channel` inconnue envoie le mot de passe à l'équipe interne
+  (repli sécurisé, avec un avertissement dans le journal).
+- **2** : garde-fou à l'entrée des hooks `download` et `dcv`. Une erreur non prévue est
+  écrite dans le journal, enregistrée en base comme échec (`download`) et signalée par
+  une alerte interne (type + message de l'erreur seulement). Rien ne part au client ;
+  le code de sortie reste 0.
+- **6 tests ajoutés** (11 au total à ce stade, tous OK) : `test_per_cert_password_internal_only`,
+  `test_unknown_password_channel_falls_back_to_internal`, `test_per_cert_pfx_disabled`,
+  `test_corrupt_certificate_alerts_internal`,
+  `test_invalid_inventory_download_alerts_internal`,
+  `test_invalid_inventory_dcv_alerts_internal`. Ils échouaient tous les 6 avant la
+  correction.
+- **Après la 1re relecture (verdict « À reprendre »)** : le garde-fou affirmait « rien
+  n'a été envoyé au client » même quand l'erreur survenait après l'envoi (base
+  verrouillée, disque plein). Corrigé : le hook note qu'il a commencé à envoyer, et
+  l'alerte prévient alors que des mails ont pu partir et qu'il ne faut pas relancer à
+  l'aveugle. Sinon, l'alerte donne la commande de relance. Test ajouté :
+  `test_error_after_sending_says_mails_may_have_left` (**12 tests, tous OK**). Il dure
+  environ 30 s, car le garde-fou attend le délai SQLite existant avant d'abandonner.
+- **2e relecture : OK avec réserves**, aucun point bloquant. Le test d'erreur après
+  envoi vérifie en plus que l'alerte va à l'équipe interne seule, sans le mot de passe
+  ni la clé privée.
+- **Réserves de la relecture non traitées** (hors périmètre, à décider) :
+  `bool("false")` vaut `True` pour `pfx_legacy` saisi entre guillemets dans
+  l'inventaire ; une erreur YAML recopie un extrait de l'inventaire dans l'alerte
+  interne et en base (interne, acceptable) ; surcharges `zip_encrypt`, `pfx_legacy` et
+  `attach_max_mb` non testées une à une.
 
 ## Relecture
 
