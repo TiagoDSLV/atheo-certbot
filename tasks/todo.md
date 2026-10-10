@@ -1,7 +1,62 @@
 # Plan en cours
 
-Plans précédents : revalidation (commit `abe2c33`), défauts 2 et 2b (commit `48a14fc`).
-Détails dans `tasks/rapport-setup.md`.
+Plans précédents : revalidation (commit `abe2c33`), défauts 2 et 2b (commit `48a14fc`),
+2c (commit `47c2ba6`). Détails dans `tasks/rapport-setup.md`.
+
+## Correction du défaut 2d — rapprochement par un seul SAN
+
+Statut : **plan à valider** — rien n'est codé
+
+### Problème (`inventory.py:369-375`, `hooks.py:29-35, 88-89`)
+
+Quand la réf. TBS et le CN sont inconnus, `Inventory.find` retient tout certificat qui
+partage **un seul** nom (SAN) avec la commande. Un SAN commun avec le certificat d'un
+autre client suffit pour lui livrer le ZIP (clé privée comprise) ; l'alias est ensuite
+mémorisé (`state.set_alias`) et la mauvaise attribution devient permanente.
+Probabilité faible, conséquence grave (clé privée chez le mauvais client).
+
+**Cause racine** : « partager au moins un nom » n'identifie pas une commande. Et en cas
+d'ambiguïté, le code choisit quand même un candidat au lieu de refuser.
+
+### Correction (`tbsdelivery/inventory.py` uniquement)
+
+1. **Rapprochement SAN strict** : on retient un candidat seulement si l'ensemble des noms
+   de la commande (CN + SAN du hook) est **identique** à l'ensemble de ses noms
+   (`Cert.names`). Un recouvrement partiel ne suffit plus.
+2. **Pas d'ambiguïté** : si plusieurs candidats correspondent et qu'ils appartiennent à
+   des clients différents (`client_slug`), on ne choisit pas : `find` renvoie `None`.
+   Le tri existant (géré, refabrication, fin de forfait) reste pour un même client.
+3. Conséquence voulue : un certificat non reconnu suit le chemin « non référencé » déjà
+   en place (livraison à l'équipe interne uniquement, pas d'alias mémorisé).
+   Le rapprochement par réf. puis par CN (exact) ne change pas.
+
+Pas de changement de schéma, ni de `hooks.py`, ni de la config.
+
+### Tests (écrits d'abord, échec constaté sur le code actuel)
+
+Dans `tests/test_e2e.py`, données fictives (`client-a.fr`, `client-b.fr`) :
+- **SAN partagé seul** : réf. et CN inconnus, un SAN commun avec le certificat du client B
+  → rien n'est envoyé à B, livraison interne « NON RÉFÉRENCÉ », aucun alias créé.
+- **Ensemble de noms identique** (réf. et CN inconnus, mêmes noms dans un autre ordre) →
+  rapproché du bon client (le cas légitime reste couvert).
+- **Ambiguïté** : deux certificats de clients différents avec le même ensemble de noms →
+  `find` renvoie `None`.
+- Test unitaire direct de `Inventory.find` pour ces 3 cas.
+- Les 22 tests existants restent verts (dont `test_delivery_after_reissue_new_reference`).
+
+### Déroulé
+1. Tests d'abord, échec montré sur le code actuel.
+2. Correction dans `inventory.py`.
+3. Suite complète, sortie montrée.
+4. `tasks/rapport-setup.md` : 2d marqué corrigé.
+5. Relecture par le sous-agent `relecteur`, verdict transmis ; commit après ton accord.
+
+### Choix et risques
+- **Risque** : une refabrication qui change légèrement la liste des SAN (ajout/retrait
+  d'un nom) n'est plus rapprochée par SAN et part à l'équipe interne. C'est le sens
+  voulu (pas de livraison au client en cas de doute) ; l'équipe peut ajouter l'alias
+  dans `inventory.yaml`. Le rapprochement par CN couvre le cas courant.
+- La réf. TBS stable ou non après refabrication reste un point à valider avec TBS.
 
 ## Correction du défaut 2c — idempotence des livraisons
 
