@@ -8,18 +8,28 @@ import email
 import os
 import re
 import shutil
+import smtplib
 import sqlite3
 import subprocess
+import sys
 import tempfile
 import unittest
+from datetime import datetime, timedelta, timezone
 from email import policy
 from pathlib import Path
+from unittest import mock
 
 import pyzipper
 import yaml
+from cryptography import x509
 from cryptography.hazmat.primitives.serialization import pkcs12
 
 ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(ROOT))
+
+from tbsdelivery import config, hooks, package  # noqa: E402
+from tbsdelivery.mailer import Mailer  # noqa: E402
+from tbsdelivery.state import State  # noqa: E402
 CSV = """Votre réf;Réf CA;CN;Nom Prod.;Réf TBS Certificats;Date d'expiration;Date de fin du forfait;Nom de l'org.;Raison sociale;Contact admin.;Mél du contact admin.;SANs.;
 "SO/1";1;"www.client-a.fr";Sectigo SSL forfait 5 ans;1000000001;24/10/2026;18/09/2028;"CLIENT A";"CLIENT A";"Jean A";"jean@client-a.fr";"";
 "SO/2";2;"mail.client-b.fr";Sectigo UCC (3+) forfait 3 ans;1000000002;16/12/2026;16/12/2026;"CLIENT B";"CLIENT B";"Paul B";"paul@client-b.fr";"mail.client-b.fr|autodiscover.client-b.fr";
@@ -217,11 +227,7 @@ class EndToEnd(unittest.TestCase):
 
     def test_error_after_sending_says_mails_may_have_left(self):
         self.run_cli("status")  # crée la base d'état
-        db = sqlite3.connect(self.tmp / "st/state.db")
-        db.execute("CREATE TRIGGER panne BEFORE INSERT ON deliveries "
-                   "BEGIN SELECT RAISE(ABORT, 'disque plein simule'); END")
-        db.commit()
-        db.close()
+        self.fail_final_write()
         key, cert, chain = self.pki("1000000001", "www.client-a.fr")
         self.hook("download", reference="1000000001", cn="www.client-a.fr", key=key, cert=cert, chain=chain)
         mails = self.outbox()
@@ -236,6 +242,187 @@ class EndToEnd(unittest.TestCase):
         password = re.search(r"\n    (\S+)\n", pwd_mail.get_body().get_content()).group(1)
         self.assertNotIn(password, alert)
         self.assertNotIn("PRIVATE KEY", alert)
+
+    # ------------------------------------------- idempotence des livraisons (défaut 2c)
+    def db(self):
+        self.run_cli("status")  # crée la base d'état si besoin
+        return sqlite3.connect(self.tmp / "st/state.db")
+
+    def fail_final_write(self):
+        """Simule une panne de la base au moment d'enregistrer la livraison terminée."""
+        db = self.db()
+        for when in ("INSERT", "UPDATE"):
+            db.execute(f"CREATE TRIGGER panne_{when} BEFORE {when} ON deliveries "
+                       "WHEN NEW.status IN ('sent','dry-run') "
+                       "BEGIN SELECT RAISE(ABORT, 'disque plein simule'); END")
+        db.commit()
+        db.close()
+
+    def statuses(self):
+        db = self.db()
+        rows = [r[0] for r in db.execute("SELECT status FROM deliveries ORDER BY id")]
+        db.close()
+        return rows
+
+    def serial_of(self, cert):
+        return format(x509.load_pem_x509_certificates(Path(cert).read_bytes())[0].serial_number, "X")
+
+    def deliver_client_a(self, *extra):
+        key, cert, chain = self.pki("1000000001", "www.client-a.fr")
+        env = dict(self.env)
+        env.update(PHP_TBS_REFERENCE="1000000001", PHP_TBS_CN="www.client-a.fr",
+                   PHP_TBS_KEY=key, PHP_TBS_CERT=cert, PHP_TBS_CHAIN=chain)
+        self.run_cli("hook", "download", *extra, env=env)
+        return key, cert, chain, env
+
+    def test_crash_after_sending_no_redelivery(self):  # cas A
+        self.fail_final_write()
+        _, _, _, env = self.deliver_client_a()
+        self.assertEqual(len(self.outbox()), 3)  # ZIP, mot de passe, alerte
+        self.run_cli("hook", "download", env=env)  # TBSCertBot ou un opérateur relance
+        self.assertEqual(len(self.outbox()), 3)  # aucune 2e livraison
+
+    def test_partial_send_blocks_redelivery(self):  # cas B
+        key, cert, chain = self.pki("1000000001", "www.client-a.fr")
+        cfg = config.load_config(self.tmp / "config.yaml")
+        real_send, calls = Mailer.send, []
+
+        def send(mailer, msg):
+            calls.append(msg["Subject"])
+            if len(calls) == 2:  # le mail du mot de passe échoue
+                raise smtplib.SMTPServerDisconnected("connexion perdue")
+            return real_send(mailer, msg)
+
+        php = {"PHP_TBS_REFERENCE": "1000000001", "PHP_TBS_CN": "www.client-a.fr",
+               "PHP_TBS_KEY": key, "PHP_TBS_CERT": cert, "PHP_TBS_CHAIN": chain}
+        with mock.patch.dict(os.environ, php), mock.patch.object(Mailer, "send", send):
+            hooks.handle_download(cfg)
+        self.assertEqual(self.statuses(), ["partial"])
+        alerts = [m for m in self.outbox() if "ALERTE" in m.name]
+        self.assertEqual(len(alerts), 1)
+        alert = self.msg(alerts[0])
+        self.assertEqual(alert["To"], self.INTERNAL)
+        body = alert.get_body().get_content()
+        self.assertIn("TBS_DELIVERY_FORCE=1", body)
+        self.assertNotIn("PRIVATE KEY", body)
+        before = len(self.outbox())
+        with mock.patch.dict(os.environ, php):
+            hooks.handle_download(cfg)  # relance automatique : rien
+        self.assertEqual(len(self.outbox()), before)
+        with mock.patch.dict(os.environ, php):
+            hooks.handle_download(cfg, force=True)  # décision humaine : nouvelle archive
+        self.assertEqual(len(self.outbox()), before + 2)
+
+    def test_delivery_in_progress_skips(self):  # cas C
+        key, cert, chain = self.pki("1000000001", "www.client-a.fr")
+        db = self.db()
+        db.execute("INSERT INTO deliveries(tbs_ref, serial, status, created_at) VALUES (?,?,?,?)",
+                   ("1000000001", self.serial_of(cert), "sending", "2026-01-01T00:00:00+00:00"))
+        db.commit()
+        db.close()
+        self.hook("download", reference="1000000001", cn="www.client-a.fr", key=key, cert=cert, chain=chain)
+        self.assertEqual(self.outbox(), [])
+        self.assertEqual(list((self.tmp / "st").glob("deliveries/**/*.zip")), [])
+
+    def test_reserve_delivery_only_once(self):
+        st = State(self.tmp / "st/state.db")
+        first = st.reserve_delivery(serial="ABC", tbs_ref="1", cn="www.client-a.fr")
+        second = State(self.tmp / "st/state.db").reserve_delivery(serial="ABC", tbs_ref="1", cn="www.client-a.fr")
+        forced = st.reserve_delivery(serial="ABC", tbs_ref="1", cn="www.client-a.fr", force=True)
+        self.assertIsNotNone(first)
+        self.assertIsNone(second)
+        self.assertIsNotNone(forced)
+
+    def test_force_redelivers_after_sent(self):
+        self.deliver_client_a()
+        self.assertEqual(len(self.outbox()), 2)
+        self.deliver_client_a("--force")
+        self.assertEqual(len(self.outbox()), 4)
+
+    def two_hours_ago(self):
+        return (datetime.now(timezone.utc) - timedelta(hours=2)).replace(microsecond=0).isoformat()
+
+    def test_notify_flags_interrupted_delivery_once(self):
+        db = self.db()
+        db.execute("INSERT INTO deliveries(tbs_ref, cn, serial, status, created_at) VALUES (?,?,?,?,?)",
+                   ("1000000001", "www.client-a.fr", "ABC", "sending", self.two_hours_ago()))
+        db.commit()
+        db.close()
+        self.run_cli("notify")
+        alerts = [m for m in self.outbox() if "ALERTE" in m.name]
+        self.assertEqual(len(alerts), 1)
+        self.assertIn("www.client-a.fr", self.msg(alerts[0])["Subject"])
+        self.assertEqual(self.statuses(), ["uncertain"])
+        self.run_cli("notify")
+        self.assertEqual(len([m for m in self.outbox() if "ALERTE" in m.name]), 1)
+
+    def test_digest_lists_partial_and_uncertain(self):
+        db = self.db()
+        for cn, status in (("www.client-a.fr", "partial"), ("vpn.client-a.fr", "uncertain")):
+            db.execute("INSERT INTO deliveries(tbs_ref, cn, serial, status, created_at) VALUES (?,?,?,?,?)",
+                       ("1000000001", cn, cn, status, self.two_hours_ago()))
+        db.commit()
+        db.close()
+        out = self.run_cli("digest", "--print")
+        self.assertIn("Livraisons à vérifier", out)
+        self.assertIn("www.client-a.fr", out.split("Livraisons à vérifier")[1])
+        self.assertIn("vpn.client-a.fr", out.split("Livraisons à vérifier")[1])
+
+    def test_zip_names_unique_within_same_second(self):
+        key, cert, chain = self.pki("1000000001", "www.client-a.fr")
+        frozen = datetime.now(timezone.utc)
+
+        class FrozenDatetime(datetime):
+            @classmethod
+            def now(cls, tz=None):
+                return frozen
+
+        out = self.tmp / "zips"
+        with mock.patch.object(package, "datetime", FrozenDatetime):
+            first = package.build_package(key_path=key, cert_path=cert, chain_path=chain, out_dir=out, client="A")
+            second = package.build_package(key_path=key, cert_path=cert, chain_path=chain, out_dir=out, client="A")
+        self.assertNotEqual(first.zip_path, second.zip_path)
+        self.assertTrue(first.zip_path.exists() and second.zip_path.exists())
+
+    def test_refused_reservation_deletes_only_its_own_zip(self):
+        key, cert, chain = self.pki("1000000001", "www.client-a.fr")
+        db = self.db()
+        db.execute("INSERT INTO deliveries(tbs_ref, serial, status, created_at) VALUES (?,?,?,?)",
+                   ("1000000001", self.serial_of(cert), "sending", self.two_hours_ago()))
+        db.commit()
+        db.close()
+        cfg = config.load_config(self.tmp / "config.yaml")
+        other = self.tmp / "st/deliveries/client-a/www.client-a.fr/archive-du-gagnant.zip"
+        other.parent.mkdir(parents=True)
+        other.write_bytes(b"zip")
+        php = {"PHP_TBS_REFERENCE": "1000000001", "PHP_TBS_CN": "www.client-a.fr",
+               "PHP_TBS_KEY": key, "PHP_TBS_CERT": cert, "PHP_TBS_CHAIN": chain}
+        # contrôle anticipé neutralisé : la course se joue à la réservation, après la fabrication
+        with mock.patch.dict(os.environ, php), mock.patch.object(hooks, "peek_serial", return_value=None):
+            hooks.handle_download(cfg)
+        self.assertEqual(self.outbox(), [])
+        self.assertEqual(list(other.parent.glob("*.zip")), [other])
+
+    def test_smtp_quit_network_error_counts_as_sent(self):
+        cfg = config.load_config(self.tmp / "config.yaml")
+        sent = []
+
+        class FakeSMTP:  # aucun serveur réel n'est contacté
+            def __init__(self, *args, **kwargs):
+                pass
+
+            def send_message(self, msg):
+                sent.append(msg)
+
+            def quit(self):
+                raise ConnectionResetError("connexion coupée après l'acceptation du mail")
+
+        mailer = Mailer(cfg)
+        mailer.dry_run = False
+        msg = mailer.build(to=["jean@client-a.fr"], cc=None, subject="test", body="corps")
+        with mock.patch.object(smtplib, "SMTP", FakeSMTP), mock.patch.object(smtplib, "SMTP_SSL", FakeSMTP):
+            self.assertEqual(mailer.send(msg), "sent")
+        self.assertEqual(len(sent), 1)
 
     def test_invalid_inventory_dcv_alerts_internal(self):
         self.break_inventory()

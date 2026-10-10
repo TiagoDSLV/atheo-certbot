@@ -104,7 +104,19 @@ def _handle_download(cfg: dict, force: bool, progress: dict) -> int:
 
     attach_ok = pkg.zip_path.stat().st_size <= float(dspec.get("attach_max_mb", 15)) * 1024 * 1024
     channel = "internal_only" if item is None else _password_channel(dspec, cn)
+    # réservation atomique AVANT l'envoi : une seule livraison par numéro de série
+    delivery_id = state.reserve_delivery(
+        serial=pkg.info.serial, force=force, tbs_ref=ref, inventory_ref=item.ref if item else None, client=client,
+        cn=pkg.info.cn, not_after=pkg.info.not_after.date().isoformat(), package_path=str(pkg.zip_path),
+        recipients=", ".join(to + (cc or [])),
+    )
+    if delivery_id is None:
+        log.info("certificat %s (série %s) déjà livré ou en cours de livraison : ignoré", cn, pkg.info.serial)
+        pkg.zip_path.unlink(missing_ok=True)  # archive inutile, son mot de passe est perdu
+        state.close()
+        return 0
     status, detail = "sent", ""
+    zip_sent = False
     progress["sending"] = True
     try:
         subject, body = templates.delivery(client=client, info=pkg.info, zip_name=pkg.zip_path.name,
@@ -112,6 +124,7 @@ def _handle_download(cfg: dict, force: bool, progress: dict) -> int:
                                            signature=signature, company=company)
         res1 = mailer.send(mailer.build(to=to, cc=cc, subject=subject, body=body,
                                         attachments=[pkg.zip_path] if attach_ok else []))
+        zip_sent = True
         if channel == "internal_only" or item is None:
             s2, b2 = templates.password_internal(client=client, info=pkg.info, zip_name=pkg.zip_path.name,
                                                  password_value=pkg.password, recipients=to,
@@ -124,21 +137,44 @@ def _handle_download(cfg: dict, force: bool, progress: dict) -> int:
         if mailer.dry_run:
             status, detail = "dry-run", f"{res1} | {res2}"
     except Exception as exc:  # noqa: BLE001 - toute erreur SMTP doit être tracée
-        status, detail = "failed", f"envoi : {exc}"
         log.exception("envoi impossible pour %s", cn)
-        _alert_internal(mailer, cfg, f"Échec d'envoi du certificat {cn} ({client})",
-                        f"{exc}\nArchive : {pkg.zip_path}\nRelance : php tbscertbot.php test-hook download {ref}")
+        if zip_sent:
+            # l'archive est partie, pas le mot de passe : pas de relivraison automatique
+            status, detail = "partial", f"archive envoyée, mot de passe non envoyé : {exc}"
+            _alert_internal(mailer, cfg, f"Envoi partiel du certificat {cn} ({client}) : mot de passe non envoyé",
+                            f"{exc}\n\nLe client a reçu l'archive {pkg.zip_path.name} mais PAS son mot de passe.\n"
+                            "Le mot de passe n'est conservé nulle part : il faut une nouvelle archive.\n"
+                            "Après avoir prévenu le client, relivrer (nouvelle archive, nouveau mot de passe) :\n"
+                            f"  TBS_DELIVERY_FORCE=1 php tbscertbot.php test-hook download {ref}")
+        else:
+            status, detail = "failed", f"envoi : {exc}"
+            _alert_internal(mailer, cfg, f"Échec d'envoi du certificat {cn} ({client})",
+                            f"{exc}\nArchive : {pkg.zip_path}\nRelance : php tbscertbot.php test-hook download {ref}")
 
-    state.record_delivery(
-        tbs_ref=ref, inventory_ref=item.ref if item else None, client=client, cn=pkg.info.cn,
-        serial=pkg.info.serial, not_after=pkg.info.not_after.date().isoformat(),
-        package_path=str(pkg.zip_path), recipients=", ".join(to + (cc or [])), status=status, detail=detail,
-    )
+    state.update_delivery(delivery_id, status=status, detail=detail)
     if status != "failed":
         state.dcv_close(tbs_refs=[ref], inventory_ref=item.ref if item else "")
     log.info("livraison %s : %s -> %s (%s)", status, pkg.info.cn, ", ".join(to), pkg.zip_path.name)
     state.close()
     return 0
+
+
+def flag_interrupted_deliveries(cfg: dict, older_than: timedelta = timedelta(hours=1)) -> int:
+    """Signale une fois les livraisons restées « sending » (processus interrompu pendant l'envoi)."""
+    state = State(cfg["paths"]["state_db"])
+    mailer = Mailer(cfg)
+    before = (datetime.now(timezone.utc) - older_than).replace(microsecond=0).isoformat()
+    rows = state.interrupted_deliveries(before)
+    for r in rows:
+        _alert_internal(mailer, cfg, f"Livraison interrompue : {r['cn']} (réf. {r['tbs_ref']})",
+                        f"La livraison commencée le {r['created_at'][:16]} UTC vers {r['recipients'] or '?'} "
+                        "s'est interrompue pendant l'envoi.\n"
+                        "Des mails ont pu partir. Vérifier le journal et la boîte d'envoi.\n"
+                        "Relivrer UNIQUEMENT si rien n'est parti :\n"
+                        f"  TBS_DELIVERY_FORCE=1 php tbscertbot.php test-hook download {r['tbs_ref']}")
+        state.update_delivery(r["id"], status="uncertain", detail="interrompue pendant l'envoi : à vérifier")
+    state.close()
+    return len(rows)
 
 
 def _password_channel(dspec: dict, cn: str) -> str:

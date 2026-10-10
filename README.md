@@ -46,7 +46,13 @@ Périmètre v1 : **livrer les fichiers**. L'installation sur les équipements de
 - **Nouvelle référence à chaque refabrication** : TBS attribue une nouvelle référence. Le rapprochement
   se fait par référence, puis par CN, puis par SAN ; l'alias est mémorisé.
 - **Une seule livraison par certificat** (numéro de série) : le cron peut repasser sans renvoyer.
-  Relivrer volontairement : `TBS_DELIVERY_FORCE=1 php tbscertbot.php test-hook download <ref>`
+  La livraison est réservée en base *avant* l'envoi (verrou SQLite), ce qui protège aussi contre
+  deux exécutions simultanées. En cas de doute, rien n'est relivré automatiquement :
+  - envoi **partiel** (archive partie, mot de passe non) : alerte interne immédiate ;
+  - envoi **interrompu** (plantage pendant l'envoi) : signalé par `notify` après une heure ;
+  - les deux figurent dans la synthèse hebdomadaire (« Livraisons à vérifier »).
+
+  Relivrer volontairement, après vérification : `TBS_DELIVERY_FORCE=1 php tbscertbot.php test-hook download <ref>`
   (nouveau ZIP, nouveau mot de passe).
 - **Mot de passe jamais stocké** : il n'existe que dans le mail. Option `password_channel: internal_only`
   pour que l'équipe le transmette par téléphone/SMS.

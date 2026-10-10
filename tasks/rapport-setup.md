@@ -75,7 +75,7 @@ pyzipper 0.4.0.
 | 1 | **Surcharges manuelles après changement de réf.** (`merge_from_csv`) | `inventory.py:320-346` | ⚠ **Défaut confirmé par sonde** : si un nouvel export TBS porte une réf. différente pour le même certificat, les surcharges (`delivery`, `dcv`, `managed: false`…) sont **perdues**, et l'ancienne entrée est supprimée, sauf si ses `notes` commencent par `[manuel]` (convention non documentée). Conséquence : mails au contact admin par défaut au lieu du destinataire choisi, ou reprise d'un certificat exclu. Conservation OK si la réf. est identique. |
 | 2 | ✅ **Corrigé (voir « Corrections » ci-dessous)** — **Erreur inattendue dans le hook download** | `hooks.py:48-93` | ⚠ **Défaut confirmé par sonde** : seule `PackageError` est rattrapée. Toute autre exception rend l'échec **silencieux** : pas d'alerte interne, pas de ligne en base, et la trace part seulement sur stderr, pas dans le fichier journal. Exemples : certificat PEM corrompu (`ValueError`), faute de frappe YAML dans `inventory.yaml` (bloque alors **toutes** les livraisons), droits insuffisants sur le dossier de sortie, erreur SQLite. TBSCertBot n'échoue pas (le wrapper fait `exit 0`) et rien ne part au client. |
 | 2b | ✅ **Corrigé** — **Surcharge `password_channel` par certificat ignorée** | `hooks.py:84-86, 95-96` | ⚠ **Défaut confirmé par le relecteur (sonde) et à la lecture** : la surcharge `delivery` de l'inventaire n'est appliquée qu'aux destinataires. `password_channel`, `pfx`, `pfx_legacy`, `zip_encrypt` et `attach_max_mb` sont lus dans la config globale. Avec `delivery: {password_channel: internal_only}` sur un certificat, **le mot de passe part quand même au client**. |
-| 2c | **Idempotence : livraison enregistrée après l'envoi** | `hooks.py:98-125` | ⚠ Constat du relecteur, à la lecture. Un plantage entre l'envoi et `record_delivery` entraîne une 2e livraison au passage suivant (nouveau ZIP, nouveau mot de passe). Si le mail du ZIP part et que celui du mot de passe échoue, le statut `failed` n'est pas compté comme livré : le client a un ZIP sans mot de passe, et la relance conseillée envoie un autre ZIP avec un autre mot de passe. |
+| 2c | ✅ **Corrigé (voir « Correction du défaut 2c »)** — **Idempotence : livraison enregistrée après l'envoi** | `hooks.py:98-125` | ⚠ Constat du relecteur, à la lecture. Un plantage entre l'envoi et `record_delivery` entraîne une 2e livraison au passage suivant (nouveau ZIP, nouveau mot de passe). Si le mail du ZIP part et que celui du mot de passe échoue, le statut `failed` n'est pas compté comme livré : le client a un ZIP sans mot de passe, et la relance conseillée envoie un autre ZIP avec un autre mot de passe. |
 | 2d | **Rapprochement par un seul SAN** | `inventory.py:369-375`, `hooks.py:78-79` | Constat du relecteur. Si la réf. et le CN sont inconnus, un seul SAN commun avec un certificat d'un autre client suffit pour lui livrer le ZIP, clé comprise, puis l'alias est mémorisé. Probabilité faible, conséquence grave. |
 | 3 | Refus d'un certificat expiré | `package.py:198` | Non testé. Code correct à la lecture (`days_left < 0` → `PackageError` → alerte interne). |
 | 4 | `password_channel: internal_only` pour un client connu | `hooks.py:96-112` | Non testé. Correct si l'option est réglée dans la config globale ; ignorée si elle était réglée par certificat (voir 2b, corrigé ; désormais testé). |
@@ -128,6 +128,45 @@ Plan validé dans `tasks/todo.md`. Seul fichier applicatif modifié : `tbsdelive
   l'inventaire ; une erreur YAML recopie un extrait de l'inventaire dans l'alerte
   interne et en base (interne, acceptable) ; surcharges `zip_encrypt`, `pfx_legacy` et
   `attach_max_mb` non testées une à une.
+
+## Correction du défaut 2c (idempotence)
+
+Plan validé dans `tasks/todo.md`. Fichiers applicatifs modifiés : `state.py`, `hooks.py`,
+`report.py`, `__main__.py`, plus le README.
+
+- La livraison est **réservée en base avant l'envoi** (`reserve_delivery`, transaction
+  `BEGIN IMMEDIATE`) : une seule réservation par numéro de série, même entre deux
+  processus simultanés.
+- Statuts : `sending` → `sent` / `dry-run`, `partial` (archive partie sans le mot de
+  passe), `failed` (rien n'est parti). `sending`, `partial` et `uncertain` comptent
+  comme « déjà livré » : **aucune relivraison automatique en cas de doute**, seul
+  `--force` relivre.
+- Envoi partiel → alerte interne immédiate avec la commande `--force`. Envoi interrompu
+  → `notify` le signale une seule fois après une heure (statut `uncertain`). Le
+  `digest` liste les deux sur 30 jours, sauf s'ils ont été relivrés avec succès.
+- Si la réservation est refusée, le ZIP fabriqué est supprimé.
+- **7 tests ajoutés (19 au total, tous OK)**. Avant la correction, 6 échouaient ;
+  `test_force_redelivers_after_sent` passait déjà et sert de garde-fou contre une
+  régression. Le trigger de `test_error_after_sending_says_mails_may_have_left` ne
+  bloque plus que l'écriture finale : il reste valable avec la réservation.
+- Effet de bord positif : la suite passe de 122 s à 31 s. L'écriture finale annule
+  désormais sa transaction en cas d'échec, ce qui supprime l'attente de 30 s du
+  garde-fou.
+- **Relecture : OK avec réserves.** Deux réserves traitées (choix « A ») :
+  - nom du ZIP rendu unique (`package.py`, suffixe aléatoire) : deux exécutions dans la
+    même seconde n'écrivent ni ne suppriment plus la même archive ;
+  - une coupure réseau pendant `QUIT` (`mailer.py`), après l'acceptation du mail, ne
+    compte plus comme un échec d'envoi.
+  3 tests ajoutés (**22 au total, tous OK**). Les deux tests de correctif échouaient
+  avant ; `test_refused_reservation_deletes_only_its_own_zip` couvre un chemin jusque-là
+  non testé.
+- Limites connues :
+  - deux `--force` simultanés livreraient deux fois ;
+  - une coupure pendant l'envoi lui-même (avant la confirmation du serveur) reste vue
+    comme `failed` ;
+  - un même incident peut produire deux alertes (garde-fou, puis `notify`) ;
+  - un certificat livré en dry-run ne sera pas relivré en live sans `--force` (à prévoir
+    pour le pilote).
 
 ## Relecture
 

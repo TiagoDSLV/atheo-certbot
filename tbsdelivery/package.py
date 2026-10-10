@@ -230,7 +230,8 @@ def build_package(
         for name, data in files.items():
             (t / name).write_bytes(data)
 
-        zip_path = dest / f"{base}_{stamp}_{info.serial[-8:]}.zip"
+        # suffixe aléatoire : deux exécutions dans la même seconde n'écrivent pas la même archive
+        zip_path = dest / f"{base}_{stamp}_{info.serial[-8:]}_{secrets.token_hex(3)}.zip"
         encrypted = False
         if zip_encrypt:
             try:

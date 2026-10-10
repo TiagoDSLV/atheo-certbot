@@ -11,7 +11,7 @@ from pathlib import Path
 from . import __version__
 from .bootstrap import CONF_SNIPPET, bootstrap_script
 from .config import load_config
-from .hooks import handle_dcv, handle_download, notify_dcv
+from .hooks import flag_interrupted_deliveries, handle_dcv, handle_download, notify_dcv
 from .inventory import Inventory, classify, read_tbs_csv
 from .report import build_rows, digest, summary, write_csv
 from .state import State
@@ -103,6 +103,9 @@ def main(argv: list[str] | None = None) -> int:
     if args.cmd == "notify":
         n = notify_dcv(cfg)
         logging.getLogger("tbs-delivery").info("notify : %d message(s) DCV envoyé(s)", n)
+        k = flag_interrupted_deliveries(cfg)
+        if k:
+            logging.getLogger("tbs-delivery").warning("notify : %d livraison(s) interrompue(s) signalée(s)", k)
         return 0
 
     if args.cmd == "digest":

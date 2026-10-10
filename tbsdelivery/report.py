@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import csv
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
 from .inventory import CATEGORY_LABELS, Cert, Inventory, estimate_reissues
@@ -129,6 +129,13 @@ def digest(cfg: dict, send: bool = True) -> str:
     lines += ["", f"Échecs de livraison (7 derniers jours) : {len(failed)}"]
     for r in failed:
         lines.append(f"  - {r['created_at'][:16]} {r['cn']} (réf. {r['tbs_ref']}) : {r['detail']}")
+
+    since = (datetime.now(timezone.utc) - timedelta(days=30)).replace(microsecond=0).isoformat()
+    to_check = state.deliveries_to_check(since)
+    lines += ["", f"Livraisons à vérifier (envoi partiel ou interrompu, 30 derniers jours) : {len(to_check)}"]
+    for r in to_check:
+        lines.append(f"  - {r['created_at'][:16]} {r['client'] or ''} / {r['cn']} (réf. {r['tbs_ref']}) "
+                     f"[{r['status']}] {r['detail'] or ''}")
 
     recent = [r for r in state.deliveries(200) if r["status"] in ("sent", "dry-run")
               and datetime.fromisoformat(r["created_at"]).date() >= today - timedelta(days=7)]

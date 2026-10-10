@@ -50,6 +50,12 @@ CREATE TABLE IF NOT EXISTS ref_aliases (
 """
 
 
+# Statuts qui comptent comme « déjà livré » : en cas de doute (envoi interrompu ou
+# partiel), aucune relivraison automatique ; seul --force (décision humaine) relivre.
+DELIVERED_STATUSES = ("sending", "partial", "uncertain", "sent", "dry-run")
+_DELIVERED_SQL = ",".join(f"'{s}'" for s in DELIVERED_STATUSES)
+
+
 def now_iso() -> str:
     return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
 
@@ -83,9 +89,52 @@ class State:
     # -- livraisons
     def already_delivered(self, serial: str) -> bool:
         row = self.db.execute(
-            "SELECT 1 FROM deliveries WHERE serial=? AND status IN ('sent','dry-run') LIMIT 1", (serial,)
+            f"SELECT 1 FROM deliveries WHERE serial=? AND status IN ({_DELIVERED_SQL}) LIMIT 1", (serial,)
         ).fetchone()
         return row is not None
+
+    def reserve_delivery(self, *, serial: str, force: bool = False, **kw) -> int | None:
+        """Réserve la livraison d'un numéro de série AVANT tout envoi (ligne « sending »).
+
+        Vérification et insertion se font sous verrou d'écriture (BEGIN IMMEDIATE) :
+        deux exécutions simultanées ne peuvent pas réserver le même certificat.
+        Retourne l'id de la ligne, ou None si une livraison existe déjà (hors force).
+        """
+        self.db.commit()
+        try:
+            self.db.execute("BEGIN IMMEDIATE")
+            if not force and self.already_delivered(serial):
+                self.db.rollback()
+                return None
+            kw.update(serial=serial, status="sending", created_at=now_iso())
+            cols = ",".join(kw)
+            cur = self.db.execute(f"INSERT INTO deliveries({cols}) VALUES ({','.join('?' * len(kw))})",
+                                  tuple(kw.values()))
+            self.db.commit()
+            return cur.lastrowid
+        except BaseException:
+            self.db.rollback()
+            raise
+
+    def update_delivery(self, delivery_id: int, **kw) -> None:
+        sets = ",".join(f"{k}=?" for k in kw)
+        with self.db:  # commit, ou rollback (verrou libéré) en cas d'erreur
+            self.db.execute(f"UPDATE deliveries SET {sets} WHERE id=?", (*kw.values(), delivery_id))
+
+    def interrupted_deliveries(self, before: str):
+        """Livraisons restées « sending » (processus interrompu pendant l'envoi)."""
+        return self.db.execute(
+            "SELECT * FROM deliveries WHERE status='sending' AND created_at < ? ORDER BY id", (before,)
+        ).fetchall()
+
+    def deliveries_to_check(self, since: str):
+        """Envois partiels ou incertains depuis `since`, non suivis d'une relivraison réussie."""
+        return self.db.execute(
+            "SELECT * FROM deliveries d WHERE d.status IN ('sending','partial','uncertain') AND d.created_at >= ? "
+            "AND NOT EXISTS (SELECT 1 FROM deliveries n WHERE n.serial=d.serial AND n.id>d.id "
+            "AND n.status IN ('sent','dry-run')) ORDER BY d.id",
+            (since,),
+        ).fetchall()
 
     def record_delivery(self, **kw) -> None:
         kw.setdefault("created_at", now_iso())

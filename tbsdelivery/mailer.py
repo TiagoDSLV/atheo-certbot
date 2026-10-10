@@ -88,6 +88,6 @@ class Mailer:
         finally:
             try:
                 server.quit()
-            except smtplib.SMTPException:
-                pass
+            except (smtplib.SMTPException, OSError):
+                pass  # le message est déjà accepté : une coupure pendant QUIT n'est pas un échec d'envoi
         return "sent"
